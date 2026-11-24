@@ -11,7 +11,7 @@ inline constexpr float kWidth=480.f,kHeight=84.f;
 inline constexpr float kBarX=18.f,kBarY=8.f,kBarW=444.f,kBarH=48.f;
 inline constexpr float kPinX=kBarX-12.5f,kPinY=22.f,kPinW=25.f,kPinH=50.f;
 struct Size {int width,height;};
-struct View {float x,y,scale;};
+struct View {float x,y,scale,width;};
 struct Rect {float x,y,w,h;};
 inline float screenFraction(int monitorW,int monitorH) noexcept {
  if(monitorW<=0||monitorH<=0)return 1.f;
@@ -26,17 +26,19 @@ inline Size requestedLogicalSize(int monitorW,int monitorH,int dpi) noexcept {
          std::max(1,int(std::lround(kHeight*f*pixelToLogical)))};
 }
 inline View fit(float x,float y,float width,float height) noexcept {
- const float factor=std::max(0.f,std::min(width/kWidth,height/kHeight));
- return {x+(width-kWidth*factor)*.5f,
-         y+(height-kHeight*factor)*.5f,
-         factor};
+ // Width comes from the actual AE control frame, not the reference
+ // artwork. Scale only the fixed-size vertical geometry and end pins.
+ // Extremely narrow panels shrink those elements only to avoid clipping.
+ constexpr float minDesignWidth=96.f;
+ const float factor=std::max(0.f,std::min(width/minDesignWidth,height/kHeight));
+ return {x,y+(height-kHeight*factor)*.5f,factor,std::max(0.f,width)};
 }
 inline Rect bar(View v) noexcept {
  return {v.x+kBarX*v.scale,v.y+kBarY*v.scale,
-         kBarW*v.scale,kBarH*v.scale};
+         std::max(0.f,v.width-2.f*kBarX*v.scale),kBarH*v.scale};
 }
 inline float pinLeft(View v,float position) noexcept {
- return v.x+(kPinX+kBarW*std::clamp(position,0.f,1.f))*v.scale;
+ return bar(v).x+bar(v).w*std::clamp(position,0.f,1.f)-kPinW*v.scale*.5f;
 }
 inline float pinCenter(View v,float position) noexcept {
  return pinLeft(v,position)+kPinW*v.scale*.5f;

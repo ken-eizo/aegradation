@@ -635,7 +635,8 @@ static PF_Err paramsSetup(PF_InData* in_data,PF_OutData* out_data){
 }
 // PF_UpdateParamUI is the officially supported cosmetic update path for
 // ui_width/ui_height. AE calls this on Effect Controls refresh; monitor
-// changes can therefore reflow the 440x119 reference when ECW updates.
+// changes can therefore update the compact reference height when ECW updates.
+// Draw and hit testing use the actual frame width, not this requested width.
 static PF_Err refreshCustomUiSize(PF_InData* in,PF_OutData* out,
                                  PF_ParamDef* params[]){
  if(!in||!out||!params||!params[P_STOPS]||!in->pica_basicP)
@@ -898,7 +899,7 @@ static bool eventCoords(PF_InData* in,PF_OutData* out,PF_EventExtra* e,float& le
  if(!in||!out||!e||!in->pica_basicP)return false;
  const auto& w=e->effect_win;bar(w.current_frame,left,top,width,height);
  float x=(float)e->u.do_click.screen_point.h,y=(float)e->u.do_click.screen_point.v;
- auto dist=[](float x,float y,float a,float b,float w,float h){float dx=std::max({a-x,0.f,x-(a+w)});float dy=std::max({b-y,0.f,y-(b+h+17)});return dx*dx+dy*dy;};
+ auto dist=[](float x,float y,float a,float b,float w,float h){float dx=std::max({a-x,0.f,x-(a+w)});float dy=std::max({b-y,0.f,y-(b+h+20.f*h/customui::kBarH)});return dx*dx+dy*dy;};
  float ld=dist(x,y,left,top,width,height);
  AEFX_SuiteScoper<PFAppSuite6,TRUE> app(in,kPFAppSuite,kPFAppSuiteVersion6,out);
  if(auto* a=app.get()){
@@ -1043,6 +1044,15 @@ static PF_Err draw(PF_InData* in,PF_OutData* out,PF_ParamDef* p[],PF_EventExtra*
  const auto viewport=customui::fit(float(frame.left),float(frame.top),
    float(frame.right-frame.left),float(frame.bottom-frame.top));
  if(viewport.scale<=0.f)return PF_Err_NONE;
+ if(perfEnabled()){
+  const auto bounds=customui::bar(viewport);
+  char message[220]{};
+  std::snprintf(message,sizeof(message),
+    "Gradation profile | Gradient ECW frame=(%ld,%ld,%ld,%ld) bar=%.2fx%.2f pinScale=%.4f\n",
+    (long)frame.left,(long)frame.top,(long)frame.right,(long)frame.bottom,
+    double(bounds.w),double(bounds.h),double(viewport.scale));
+  debugLog(message);
+ }
  const auto theme=customui::colors(currentAETheme(in,out));
  // AE paints the Effect Controls background. Leave this area untouched:
  // PF_AppGetBgColor is not necessarily the actual panel surface color.
@@ -1059,9 +1069,13 @@ static PF_Err draw(PF_InData* in,PF_OutData* out,PF_ParamDef* p[],PF_EventExtra*
   (void)supplier->SupportsPixelLayoutBGRA(s,&supportsBGRA);
  if(supplier->SupportsPixelLayoutARGB)
   (void)supplier->SupportsPixelLayoutARGB(s,&supportsARGB);
- const int previewWidth=std::clamp((int)std::lround(w),24,2048);
+ // Do not silently truncate the preview when a wide panel exceeds 2048.
+ // Ordinary screen widths use a single Drawbot image, while extremely
+ // large host frames use the existing bounded path fallback.
+ const bool imageFits=w<=8192.f&&h<=512.f;
+ const int previewWidth=std::clamp((int)std::lround(w),1,8192);
  const int previewHeight=std::clamp((int)std::lround(h),1,512);
- if(supportsBGRA||supportsARGB){
+ if(imageFits&&(supportsBGRA||supportsARGB)){
   const bool bgra=(supportsBGRA!=FALSE);
   const DRAWBOT_PixelLayout layout=bgra?
        kDRAWBOT_PixelLayout_32BGRA_Premul:
@@ -1280,7 +1294,7 @@ static PF_Err event(PF_InData* in,PF_OutData* out,PF_ParamDef* p[],PF_EventExtra
  if(!eventCoords(in,out,e,x,y,w,h))return PF_Err_NONE;
  auto& click=e->u.do_click;
  float cx=(float)click.screen_point.h,cy=(float)click.screen_point.v;
- const float uiScale=w/customui::kBarW;
+ const float uiScale=h/customui::kBarH;
  if(e->e_type==PF_Event_DO_CLICK&&
     (cy<y-8.f*uiScale||cy>y+h+20.f*uiScale||
      cx<x-13.f*uiScale||cx>x+w+13.f*uiScale))return PF_Err_NONE;
