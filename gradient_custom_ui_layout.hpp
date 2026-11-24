@@ -1,14 +1,15 @@
 #pragma once
-// Native Adobe Drawbot geometry from Gradient_CustomUIGenerated.slugui.
-// Reference is 440x119 physical pixels on a 3840x2160 display at 150%.
+// Compact runtime geometry derived from the authored Figma stop paths.
+// The original .slugui is retained byte-identically.
+// 480x84 physical reference at 4K/150%; larger bar, tighter vertical margins.
 // No Slugia dependency; the AE host retains control of event delivery/painting.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 namespace gradation::customui {
-inline constexpr float kWidth=440.f,kHeight=119.f;
-inline constexpr float kBarX=26.f,kBarY=33.f,kBarW=389.f,kBarH=47.f;
-inline constexpr float kPinX=13.f,kPinY=43.f,kPinW=25.f,kPinH=50.f;
+inline constexpr float kWidth=480.f,kHeight=84.f;
+inline constexpr float kBarX=18.f,kBarY=8.f,kBarW=444.f,kBarH=48.f;
+inline constexpr float kPinX=kBarX-12.5f,kPinY=22.f,kPinW=25.f,kPinH=50.f;
 struct Size {int width,height;};
 struct View {float x,y,scale;};
 struct Rect {float x,y,w,h;};

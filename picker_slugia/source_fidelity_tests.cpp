@@ -99,11 +99,18 @@ int main(){
   require(pickerColorConfig.enableInProcessPipelineCache&&
           pickerColorConfig.vsync,
           "Preserve lightweight cached and synchronized picker renderer configuration");
-  const auto native100=gradation::picker::pickerOuterSize(96);
-  const auto native150=gradation::picker::pickerOuterSize(144);
-  require(native100.width==492&&native100.height==322&&
-          native150.width==739&&native150.height==483,
-          "Reference screenshot exact outer sizes at 100/150% DPI");
+  const auto native100=gradation::picker::pickerClientSize(96);
+  const auto native150=gradation::picker::pickerClientSize(144);
+  require(native100.width==531&&native100.height==296&&
+          native150.width==797&&native150.height==444,
+          "Authored alpha-inclusive client at standard AE SV plane scale");
+  for(unsigned dpi:{96u,120u,144u,192u}){
+   const auto size=gradation::picker::pickerClientSize(dpi);
+   const float scale=gradation::picker::pickerClientScale(size.width,size.height);
+   require(std::abs(size.height-444.f*scale)<=1.f&&
+           std::abs(size.width-797.f*scale)<=1.1f,
+           "No letterboxed bottom or right gap at native client sizes");
+  }
   // Legacy screen fraction helper remains available for other UI layouts.
   require(gradation::picker::pickerScreenScale(3840,2160)==1.f&&
           gradation::picker::pickerScreenScale(1920,1080)==.5f&&

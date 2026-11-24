@@ -8,6 +8,7 @@
 #include "AE_EffectCB.h"
 #include "AE_EffectUI.h"
 #include "AE_EffectSuites.h"
+#include "AE_AdvEffectSuites.h"
 #include "AE_EffectCBSuites.h"
 #include "AE_EffectPixelFormat.h"
 #include "AE_GeneralPlug.h" // AEGP_UtilitySuite6::AEGP_GetMainHWND (official host HWND)
@@ -576,7 +577,7 @@ static customui::Size nativeGradientControlSize() noexcept {
  return customui::requestedLogicalSize(mw,mh,int(dpi?dpi:96));
 #else
  // AppKit logical points; AE owns the Retina backing-scale conversion.
- return {293,79};
+ return customui::requestedLogicalSize(3840,2160,144);
 #endif
 }
 static PF_Err paramsSetup(PF_InData* in_data,PF_OutData* out_data){
@@ -1229,6 +1230,9 @@ struct LiveStopPreview {
  PF_EventExtra* event=nullptr;
  StopsData* data=nullptr;
  const PFAppSuite6* app=nullptr;
+ PF_OutData* out=nullptr;
+ const PF_AdvAppSuite2* refresh=nullptr;
+ const PF_AdvItemSuite1* item=nullptr;
  int index=-1;
  bool updated=false;
 };
@@ -1244,6 +1248,11 @@ static void onColorPickerPreview(void* opaque,const stopui::RGBA& value) noexcep
  s.r=r;s.g=g;s.b=b;s.a=a;
  if(!writeStops(ctx->in,ctx->param,*ctx->data)){s=original;return;}
  ctx->updated=true;
+ // The ARB handle is unlocked before calling the host. Changed-value
+ // and FORCE_RERENDER are consumed by AE at event return; the documented
+ // advanced suites also request the active composition's refresh NOW.
+ // No timeline movement, stream writes, private APIs or render threads.
+ if(ctx->out)ctx->out->out_flags|=PF_OutFlag_FORCE_RERENDER;
  if(ctx->event){
   ctx->event->evt_out_flags|=PF_EO_HANDLED_EVENT|PF_EO_UPDATE_NOW;
   if(ctx->app&&ctx->app->PF_InvalidateRect&&ctx->event->contextH&&
@@ -1253,6 +1262,10 @@ static void onColorPickerPreview(void* opaque,const stopui::RGBA& value) noexcep
    (void)ctx->app->PF_InvalidateRect(ctx->event->contextH,nullptr);
   }
  }
+ if(ctx->item&&ctx->item->PF_TouchActiveItem)
+  (void)ctx->item->PF_TouchActiveItem();
+ if(ctx->refresh&&ctx->refresh->PF_RefreshAllWindows)
+  (void)ctx->refresh->PF_RefreshAllWindows();
 }
 // Custom Figma SlugUI dialog is launched from this official SDK event.
 // Win32 DialogBoxIndirectParamW owns modal state and the message loop.
@@ -1318,8 +1331,15 @@ static PF_Err event(PF_InData* in,PF_OutData* out,PF_ParamDef* p[],PF_EventExtra
     SPBasicSuite* suites=in->pica_basicP;
     if(suites&&suites->AcquireSuite)
      (void)suites->AcquireSuite(kPFAppSuite,kPFAppSuiteVersion6,&appRaw);
+    // Optional documented suites are acquired only while the modal owns
+    // the SDK UI callback. Their RAII lifetime spans all live notifications.
+    AEFX_SuiteScoper<PF_AdvAppSuite2,true> refresh(
+        in,kPFAdvAppSuite,kPFAdvAppSuiteVersion2,out);
+    AEFX_SuiteScoper<PF_AdvItemSuite1,true> item(
+        in,kPFAdvItemSuite,kPFAdvItemSuiteVersion1,out);
     LiveStopPreview preview{
-      in,p[P_STOPS],e,&st,static_cast<const PFAppSuite6*>(appRaw),hit,false};
+      in,p[P_STOPS],e,&st,static_cast<const PFAppSuite6*>(appRaw),
+      out,refresh.get(),item.get(),hit,false};
     const bool accepted=stopui::editRGBA(
        owner,edited,activeDepth,&pickerFailure,&onColorPickerPreview,&preview,
        (int)currentAETheme(in,out));
@@ -1347,6 +1367,9 @@ static PF_Err event(PF_InData* in,PF_OutData* out,PF_ParamDef* p[],PF_EventExtra
      // A canceled preview must not leave transient RGBA in the project.
      st=beforePicker;
      (void)writeStops(in,p[P_STOPS],st);
+     // A restored frame must not retain the transient preview in AE's cache.
+     p[P_STOPS]->uu.change_flags|=PF_ChangeFlag_CHANGED_VALUE;
+     out->out_flags|=PF_OutFlag_FORCE_RERENDER;
      if(preview.app&&preview.app->PF_InvalidateRect&&e->contextH&&
         *e->contextH)
       (void)preview.app->PF_InvalidateRect(e->contextH,nullptr);

@@ -8,12 +8,13 @@
 namespace gradation::picker {
 inline constexpr int kDesignedWidth=797, kDesignedHeight=444;
 struct PickerOuterSize{int width,height;};
-[[nodiscard]] inline PickerOuterSize pickerOuterSize(unsigned dpi) noexcept {
- if(dpi==0||dpi==96)return {492,322};
- if(dpi==144)return {739,483};
- const float k=float(dpi)/96.f;
- return {std::max(1,int(std::lround((739.f/1.5f)*k))),
-         std::max(1,int(std::lround(322.f*k)))};
+// The standard AE SV plane is 386px at 150% and 257px at 100%.
+ // The authored 797x444 client includes the extra alpha bar. Size the CLIENT,
+ // not the outer window: the OS owns title bar/frame metrics independently.
+[[nodiscard]] inline PickerOuterSize pickerClientSize(unsigned dpi) noexcept {
+ const float scale=float(dpi?dpi:96)/144.f;
+ return {std::max(1,int(std::lround(kDesignedWidth*scale))),
+         std::max(1,int(std::lround(kDesignedHeight*scale)))};
 }
 [[nodiscard]] inline float pickerClientScale(int width,int height) noexcept {
  if(width<=0||height<=0)return 1.f;

@@ -177,11 +177,25 @@ static UINT pickerMonitorDpi(HMONITOR monitor,HWND fallback) noexcept {
  }
  return x?x:(fallback?GetDpiForWindow(fallback):96);
 }
+// Match AE's client-area scale, including the extra alpha channel width.
+ // GetWindowRect/SetWindowPos are outer dimensions; the OS computes nonclient
+ // sizes for the exact dialog style and monitor DPI.
+static gp::PickerOuterSize nativePickerOuterSize(HWND dialog,UINT dpi) noexcept {
+ const auto client=gp::pickerClientSize(dpi);
+ RECT r{0,0,client.width,client.height};
+ const DWORD style=static_cast<DWORD>(GetWindowLongPtrW(dialog,GWL_STYLE));
+ const DWORD ex=static_cast<DWORD>(GetWindowLongPtrW(dialog,GWL_EXSTYLE));
+ if(AdjustWindowRectExForDpi(&r,style,FALSE,ex,dpi?dpi:96))
+  return {int(r.right-r.left),int(r.bottom-r.top)};
+ if(AdjustWindowRectEx(&r,style,FALSE,ex))
+  return {int(r.right-r.left),int(r.bottom-r.top)};
+ return client;
+}
 // Sizing/centering is done BEFORE the OS displays the modal window.
 void centerDialogOnMonitor(HWND dialog,float& uiScale) noexcept {
  RECT current{}, client{};
  if(!GetWindowRect(dialog,&current)||!GetClientRect(dialog,&client))return;
- // Reference outer sizes are 492x322 at 100% and 739x483 at 150%.
+ // Size to the AE reference client-area scale, including the alpha column.
  int width=0,height=0;
  MONITORINFO info{};
  info.cbSize=sizeof(info);
@@ -195,7 +209,7 @@ void centerDialogOnMonitor(HWND dialog,float& uiScale) noexcept {
    MonitorFromWindow(owner?owner:dialog,MONITOR_DEFAULTTONEAREST);
  if(!GetMonitorInfoW(monitor,&info))return;
  const RECT area=info.rcWork;
- const auto target=gp::pickerOuterSize(pickerMonitorDpi(monitor,dialog));
+ const auto target=nativePickerOuterSize(dialog,pickerMonitorDpi(monitor,dialog));
  width=target.width;height=target.height;
  const int x=area.left+((area.right-area.left)-width)/2;
  const int y=area.top+((area.bottom-area.top)-height)/2;
@@ -277,16 +291,18 @@ struct Session {
   const auto now=std::chrono::steady_clock::now();
   // Coalesce live AE renders, retaining the last edit even if input stops.
   // Never recursively enter AE from a nested modal message.
-  if(previewActive||(!force&&lastPublishedAt.time_since_epoch().count()!=0&&
+  if(previewActive||(!model.finished&&lastPublishedAt.time_since_epoch().count()!=0&&
      now-lastPublishedAt<std::chrono::milliseconds(33))){
    SetTimer(window,3,33,nullptr);return;
   }
   KillTimer(window,3);
   lastPublished=target;
-  lastPublishedAt=now;
   previewActive=true;
   onLive(liveContext,target);
   previewActive=false;
+  lastPublishedAt=std::chrono::steady_clock::now();
+  (void)force; // Final OK/Cancel commits in PF_Cmd_EVENT.
+
  }
  // Called only from the modal's own UI thread. Moving the color picker
  // from one DPI to another uses the exact native reference window dimensions.
@@ -296,7 +312,7 @@ struct Session {
   if(!next||next==activeMonitor)return;
   MONITORINFO info{};info.cbSize=sizeof(info);
   if(!GetMonitorInfoW(next,&info))return;
-  const auto target=gp::pickerOuterSize(pickerMonitorDpi(next,window));
+  const auto target=nativePickerOuterSize(window,pickerMonitorDpi(next,window));
   RECT outer{},client{};
   if(!GetWindowRect(window,&outer)||!GetClientRect(window,&client))return;
   const int w=target.width,h=target.height;
@@ -603,7 +619,7 @@ struct Session {
     updateMonitorScale();
     return FALSE;
    case WM_DPICHANGED:{
-    const auto target=gp::pickerOuterSize(HIWORD(wp));
+    const auto target=nativePickerOuterSize(window,HIWORD(wp));
     const RECT* suggested=reinterpret_cast<const RECT*>(lp);
     if(suggested){
      activeMonitor=MonitorFromRect(suggested,MONITOR_DEFAULTTONEAREST);
