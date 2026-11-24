@@ -2,6 +2,27 @@
 
 Native Adobe After Effects effect plugin. Linear / Radial / Angle / Mapping, up to 32 gradient stops, multiple color spaces and separate color/alpha blending. Shared SmartFX/MFR render core; Windows CUDA and an initial native macOS Metal port.
 
+## Repository layout
+
+See [architecture and contributor rules](docs/ARCHITECTURE.md).
+
+| Directory | Responsibility |
+|---|---|
+| `src/ae/` | Adobe SDK entry point, SmartFX, UI events, host cache |
+| `src/core/` | Gradient math, color spaces and stop interpolation |
+| `src/render/cpu/` | CPU kernels, AVX2, NEON and caching |
+| `src/render/gpu/` | CUDA and Metal backends; shared GPU parameter ABI |
+| `src/ui/` | Shared UI model, Windows/Slugia and macOS/AppKit |
+| `assets/` | Original Figma designs, PiPL resource, native cursors |
+| `tests/` | Core/render/UI/host tests, fixtures and test utilities |
+| `benchmarks/` | Explicit opt-in performance benchmarks |
+| `experiments/` | Research and legacy prototypes; not linked to the plugin |
+| `cmake/` | Platform build and test definitions |
+| `tools/`, `scripts/` | Build generators and collaborator entry points |
+| `docs/` | Architecture and validation documentation |
+
+Build products live in ignored `build/` and `dist/`. Historical local scripts and logs stay in ignored `backups/`, not in the public repository. Build a benchmark explicitly with `cmake --build build --config Release --target gradation_benchmark_cpu_matrix`.
+
 ## Status (2026-11-24)
 
 - Windows x64: existing AVX2 CPU (8/16/32 bpc) and CUDA SmartFX GPU (32 bpc). Release AEX and focused SDK tests rebuilt after the platform split.
@@ -52,7 +73,6 @@ git -C ..\slugia apply --check "$PWD\dependencies\slugia-gradation.patch"
 git -C ..\slugia apply "$PWD\dependencies\slugia-gradation.patch"
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DAE_SDK_ROOT="C:/path/to/SDK/Examples" -DGRADATION_SLUGIA_SOURCE="../slugia"
 cmake --build build --config Release --parallel 2
-cmake --build build --config Release --target gradation_sdk_modal_lifetime_test
 ctest --test-dir build -C Release --output-on-failure
 ```
 
@@ -60,4 +80,4 @@ Do not apply the patch twice or overwrite a modified Slugia checkout. Windows ou
 
 ## Mac collaborator verification
 
-See [MACOS_VALIDATION.md](MACOS_VALIDATION.md). Report build logs, architecture, SDK/AE/macOS versions, CPU/GPU test results and crash reports. Do not describe the port as fully supported until physical Mac checks pass.
+See [macOS validation](docs/MACOS_VALIDATION.md). Report build logs, architecture, SDK/AE/macOS versions, CPU/GPU test results and crash reports. Do not describe the port as fully supported until physical Mac checks pass.

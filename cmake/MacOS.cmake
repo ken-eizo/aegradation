@@ -8,7 +8,7 @@ foreach(f Headers/AEConfig.h Headers/AE_EffectGPUSuites.h Util/entry.h Resources
  endif()
 endforeach()
 include("${CMAKE_CURRENT_LIST_DIR}/MetalLibrary.cmake")
-add_library(Gradation MODULE Gradation.cpp gradation_metal_host.mm picker_macos.mm)
+add_library(Gradation MODULE src/ae/Gradation.cpp src/render/gpu/metal/gradation_metal_host.mm src/ui/macos/picker_macos.mm)
 add_dependencies(Gradation gradation_metal_sources gradation_metal_library)
 target_include_directories(Gradation PRIVATE "${AE_SDK_ROOT}/Headers" "${AE_SDK_ROOT}/Headers/SP"
  "${AE_SDK_ROOT}/Util" "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -29,8 +29,8 @@ set_target_properties(Gradation PROPERTIES BUNDLE TRUE BUNDLE_EXTENSION plugin P
  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dist/$<CONFIG>")
 set(PIPL "${CMAKE_CURRENT_BINARY_DIR}/Gradation.rsrc")
 add_custom_command(OUTPUT "${PIPL}"
- COMMAND "${XCRUN}" -sdk macosx Rez -d Rez=1 -d __aarch64__=1 -I "${AE_SDK_ROOT}/Headers" -I "${AE_SDK_ROOT}/Resources" "${CMAKE_CURRENT_SOURCE_DIR}/GradationPiPL.r" -o "${PIPL}"
- DEPENDS GradationPiPL.r "${AE_SDK_ROOT}/Resources/AE_General.r" "${AE_SDK_ROOT}/Headers/AEConfig.h" "${AE_SDK_ROOT}/Headers/AE_EffectVers.h" VERBATIM)
+ COMMAND "${XCRUN}" -sdk macosx Rez -d Rez=1 -d __aarch64__=1 -I "${AE_SDK_ROOT}/Headers" -I "${AE_SDK_ROOT}/Resources" "${CMAKE_CURRENT_SOURCE_DIR}/assets/ae/GradationPiPL.r" -o "${PIPL}"
+ DEPENDS assets/ae/GradationPiPL.r "${AE_SDK_ROOT}/Resources/AE_General.r" "${AE_SDK_ROOT}/Headers/AEConfig.h" "${AE_SDK_ROOT}/Headers/AE_EffectVers.h" VERBATIM)
 add_custom_target(gradation_macos_pipl DEPENDS "${PIPL}")
 add_dependencies(Gradation gradation_macos_pipl)
 add_custom_command(TARGET Gradation POST_BUILD
