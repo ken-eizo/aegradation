@@ -41,3 +41,5 @@ The research and legacy sources in experiments are not product code.
   stable. Validate both CPU and GPU paths when rendering behavior changes.
 
 See README for build commands and MACOS_VALIDATION.md for physical Mac tests.
+
+See [performance notes](PERFORMANCE.md) for measured kernel changes and reproducible benchmarks.

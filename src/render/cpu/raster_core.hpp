@@ -470,7 +470,9 @@ void renderImpl(const Buffer& src,const WritableBuffer& dst,const Settings& s,
  // scalar behavior for odd widths, cropping or arbitrary transforms.
  if constexpr(Mode==Shape::Linear&&!std::is_same_v<P,Pixel32>){
   #if !defined(GRADATION_DISABLE_VERTICAL_REUSE)
-  if constexpr(std::is_same_v<P,Pixel8>){
+  // Reuse one exact packed SIMD sample per vertical scanline for U8
+  // and U16. Restrict to full 8-pixel blocks so scalar tail rounding
+  // remains unchanged. The source alpha arithmetic is unchanged.
   if(dx==0.f&&dy!=0.f&&dst.width>=128&&dst.width%8==0&&
      std::isfinite(s.startX)&&std::abs(s.startX)<1.e8f&&
      shiftX>=0&&shiftY>=0&&
@@ -486,12 +488,18 @@ void renderImpl(const Buffer& src,const WritableBuffer& dst,const Settings& s,
     const auto c=_mm256_load_si256((const __m256i*)sample);
     const auto* in=src.data+(std::ptrdiff_t)(y+shiftY)*src.rowBytes+(size_t)shiftX*sizeof(P);
     auto* out=dst.data+(std::ptrdiff_t)y*dst.rowBytes;
-    for(int x=0;x<dst.width;x+=8){
-     simd::applyPacked8(out+(size_t)x*4,in+(size_t)x*4,c);
+    if constexpr(std::is_same_v<P,Pixel8>){
+     for(int x=0;x<dst.width;x+=8)
+      simd::applyPacked8(out+(size_t)x*4,in+(size_t)x*4,c);
+    }else{
+     // All four lanes hold the same premultiplied Q15 color.
+     for(int x=0;x<dst.width;x+=4){
+      const auto source=_mm256_loadu_si256((const __m256i*)(in+(size_t)x*8));
+      _mm256_storeu_si256((__m256i*)(out+(size_t)x*8),simd::mulSourceAlpha16(c,source));
+     }
     }
    }
    return;
-  }
   }
 #endif
   if(dy==0.f&&dst.width>=128&&dst.width<=4096&&dst.width%8==0&&

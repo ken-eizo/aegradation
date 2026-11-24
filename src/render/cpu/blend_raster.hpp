@@ -60,7 +60,59 @@ bool renderAxisComposite(const Buffer& src,const WritableBuffer& dst,const Setti
  return true;
 }
 #endif
-template<class P,Shape Mode>
+#if !defined(__AVX2__)
+template<class P>
+bool renderScalarAxisComposite(const Buffer& src,const WritableBuffer& dst,
+ const Settings& s,const Ramp& ramp,const blend::Config& cfg,const DirectRamp* direct,
+ float dx,float dy,float a,float b,float invScale,float offset,int64_t sx,int64_t sy) noexcept {
+ if(!src.data||dst.width<128||dst.width>4096||dst.height<16||
+    sx<0||sy<0||sx+dst.width>src.width||sy+dst.height>src.height||
+    (dx!=0.f&&dy!=0.f)||!std::isfinite(a)||!std::isfinite(b)||
+    !std::isfinite(s.startX)||!std::isfinite(s.startY)||
+    !std::isfinite(invScale)||!std::isfinite(offset))
+  return false;
+ // Keep the original scalar rounding order, including signed zero.
+ // Reject unusual rows rather than approximating their coordinates.
+ const bool vertical=dx==0.f&&dy!=0.f;
+ const auto rowBase=[&](int y){
+  return b*(float(y+dst.originY)-s.startY)-a*s.startX;
+ };
+ const float firstBase=rowBase(0);
+ const auto coord=[&](int x,float base){return a*float(x+dst.originX)+base;};
+ const auto identical=[](float lhs,float rhs){return std::memcmp(&lhs,&rhs,sizeof(float))==0;};
+ for(int y=0;y<dst.height;y++){
+  const float base=rowBase(y);
+  if(!std::isfinite(base))return false;
+  if(vertical){
+   if(!identical(coord(0,base),coord(dst.width-1,base)))return false;
+  }else if(!identical(base,firstBase))return false;
+ }
+ const auto sample=[&](float t){
+  const float u=transform(t,invScale,offset,s.loop,s.reflect,s.invert);
+  return direct?sampleDirectSrgb(*direct,u):lookup(ramp,u);
+ };
+ // 64 KiB maximum stack storage, independent of image height.
+ std::array<Color,4096> scan;
+ if(!vertical)for(int x=0;x<dst.width;x++)scan[size_t(x)]=sample(coord(x,firstBase));
+ for(int y=0;y<dst.height;y++){
+  const auto* in=src.data+std::ptrdiff_t(y+sy)*src.rowBytes+size_t(sx)*sizeof(P);
+  auto* out=dst.data+std::ptrdiff_t(y)*dst.rowBytes;
+  const Color rowColor=vertical?sample(coord(0,rowBase(y))):Color{};
+  auto row=[&](auto getColor){
+   for(int x=0;x<dst.width;x++){
+    P p{};std::memcpy(&p,in+size_t(x)*sizeof(P),sizeof(P));
+    const P result=storeComposite<P>(blend::compose(loadSource<P>(p),getColor(x),cfg,
+                         x+dst.originX,y+dst.originY));
+    std::memcpy(out+size_t(x)*sizeof(P),&result,sizeof(P));
+   }
+  };
+  if(vertical)row([&](int){return rowColor;});
+  else row([&](int x){return scan[size_t(x)];});
+ }
+ return true;
+}
+#endif
+template<class P,Shape Mode,bool EnableScalarAxisCache=true>
 void renderComposite(const Buffer& src,const WritableBuffer& dst,const Settings& s,
                      const Ramp& ramp,const blend::Config& blending,
                      const DirectRamp* direct=nullptr)noexcept {
@@ -73,6 +125,12 @@ void renderComposite(const Buffer& src,const WritableBuffer& dst,const Settings&
  constexpr float INV_TAU=1.f/6.28318530717958647692f;
  const int64_t shiftX=(int64_t)dst.originX-(int64_t)src.originX;
  const int64_t shiftY=(int64_t)dst.originY-(int64_t)src.originY;
+#if !defined(__AVX2__)
+ if constexpr(Mode==Shape::Linear&&EnableScalarAxisCache){
+  if(renderScalarAxisComposite<P>(src,dst,s,ramp,blending,direct,dx,dy,a,b,
+                                  invScale,offset,shiftX,shiftY))return;
+ }
+#endif
 #if defined(__AVX2__) && !defined(GRADATION_DISABLE_COMPOSITE_AXIS_CACHE)
  if constexpr(Mode==Shape::Linear&&!std::is_same_v<P,Pixel8>){
   if(renderAxisComposite<P>(src,dst,s,ramp,blending,direct,len,dx,dy,

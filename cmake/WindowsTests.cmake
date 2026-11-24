@@ -396,3 +396,7 @@ target_compile_options(gradation_blend_graph_tests PRIVATE /arch:AVX2 /fp:precis
 add_test(NAME gradation_blend_graph_tests COMMAND gradation_blend_graph_tests)
 
 # Opt-in packed blend LUT A/B experiment.
+
+add_executable(gradation_scalar_axis_cache_tests tests/render/scalar_axis_cache_tests.cpp)
+target_compile_options(gradation_scalar_axis_cache_tests PRIVATE /fp:precise)
+add_test(NAME gradation_scalar_axis_cache_tests COMMAND gradation_scalar_axis_cache_tests)

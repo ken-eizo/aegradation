@@ -43,3 +43,4 @@ add_custom_target(gradation_metal_sources DEPENDS "${METAL_GENERATED}" "${METAL_
 gradation_portable_test(gradation_metal_abi_tests tests/host/metal_abi_tests.cpp)
 add_dependencies(gradation_metal_abi_tests gradation_metal_sources)
 target_include_directories(gradation_metal_abi_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
+gradation_portable_test(gradation_scalar_axis_cache_tests tests/render/scalar_axis_cache_tests.cpp)
