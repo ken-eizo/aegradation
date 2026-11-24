@@ -1,0 +1,7 @@
+execute_process(COMMAND "${BASELINE}" "${OUTPUT_DIR}/float_lut_base.bin" RESULT_VARIABLE a)
+execute_process(COMMAND "${OPTIMIZED}" "${OUTPUT_DIR}/float_lut_opt.bin" RESULT_VARIABLE b)
+execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${OUTPUT_DIR}/float_lut_base.bin" "${OUTPUT_DIR}/float_lut_opt.bin" RESULT_VARIABLE c)
+file(REMOVE "${OUTPUT_DIR}/float_lut_base.bin" "${OUTPUT_DIR}/float_lut_opt.bin")
+if(NOT a EQUAL 0 OR NOT b EQUAL 0 OR NOT c EQUAL 0)
+ message(FATAL_ERROR "F32 LUT baseline/optimized byte parity failed")
+endif()

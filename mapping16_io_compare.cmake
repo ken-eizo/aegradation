@@ -1,0 +1,7 @@
+execute_process(COMMAND "${BASELINE}" "${OUTPUT_DIR}/mapping16_base.bin" RESULT_VARIABLE a)
+execute_process(COMMAND "${OPTIMIZED}" "${OUTPUT_DIR}/mapping16_opt.bin" RESULT_VARIABLE b)
+execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${OUTPUT_DIR}/mapping16_base.bin" "${OUTPUT_DIR}/mapping16_opt.bin" RESULT_VARIABLE c)
+file(REMOVE "${OUTPUT_DIR}/mapping16_base.bin" "${OUTPUT_DIR}/mapping16_opt.bin")
+if(NOT a EQUAL 0 OR NOT b EQUAL 0 OR NOT c EQUAL 0)
+ message(FATAL_ERROR "Mapping16 baseline/optimized byte parity failed")
+endif()

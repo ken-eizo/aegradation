@@ -1,0 +1,24 @@
+# Build/output and private working material
+/build/
+/build_*/
+/dist/
+/backups/
+/backup_*/
+/candidate_*/
+/__pycache__/
+**/__pycache__/
+*.aex
+*.plugin/
+*.aep
+*.avi
+*.log
+*.obj
+*.pdb
+*.fatbin
+*.metallib
+*.air
+*.rsrc
+*.user
+.DS_Store
+.env
+.env.*

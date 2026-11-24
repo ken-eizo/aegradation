@@ -1,0 +1,795 @@
+diff --git a/include/slugia/slugui.hpp b/include/slugia/slugui.hpp
+index 0ddf821..6c4d7ca 100644
+--- a/include/slugia/slugui.hpp
++++ b/include/slugia/slugui.hpp
+@@ -258,6 +258,14 @@ struct TextVisual {
+   std::vector<TextRun> runs = {};
+ };
+ 
++// A CPU-updated renderer-owned pixel buffer. Coordinates and clipping remain
++// SlugUI-authored; there is one image command, with no per-cell AA seams.
++struct ExternalImageVisual {
++  ExternalImageId image = 0;
++  std::uint32_t width = 0;
++  std::uint32_t height = 0;
++};
++
+ struct InstancePropertyOverride {
+   PropertyId target = 0;
+   PropertyValue value = false;
+@@ -276,7 +284,8 @@ struct InstanceVisual {
+ };
+ 
+ using Visual = std::variant<
+-  EmptyVisual, RoundedRectangleVisual, ShapeVisual, TextVisual, InstanceVisual>;
++  EmptyVisual, RoundedRectangleVisual, ShapeVisual, TextVisual,
++  ExternalImageVisual, InstanceVisual>;
+ 
+ struct InteractionSpec {
+   bool interactive = false;
+diff --git a/include/slugia/ui.hpp b/include/slugia/ui.hpp
+index 3862c72..1832311 100644
+--- a/include/slugia/ui.hpp
++++ b/include/slugia/ui.hpp
+@@ -82,8 +82,25 @@ public:
+ 
+   void beginFrame(const InputState& input, DrawList& drawList);
+   void endFrame();
++  // Input-only widgets preserve focus/caret/edit state without creating
++  // throwaway DrawList graphics. Set only for an externally drawn UI.
++  void setInputOnly(bool enabled) noexcept { inputOnly_ = enabled; }
+   void setClipboardCallbacks(ClipboardCallbacks callbacks) { clipboard_ = std::move(callbacks); }
+   void focusText(WidgetId id, std::string_view value, std::size_t caretByteOffset);
++  // Visible Figma controls can supply their own glyph hit mapping. Keeps
++  // native TextEditState undo/history/selection without drawing UiContext UI.
++  void selectAllText(WidgetId id, std::string_view value) {
++    auto& edit = textEdits_[id];
++    if(edit.value != value)edit.reset(value,false);
++    edit.selectAll();
++    focused_=id;
++  }
++  void setTextCaret(WidgetId id, std::size_t byteOffset, bool extend = false) {
++    auto& edit=textEdits_[id];
++    edit.caret=std::min(byteOffset,edit.value.size());
++    if(!extend)edit.anchor=edit.caret;
++    focused_=id;
++  }
+ 
+   Interaction interaction(WidgetId id, Rect bounds);
+   bool button(WidgetId id, std::string_view label, Rect bounds);
+@@ -107,6 +124,13 @@ public:
+ 
+   [[nodiscard]] WidgetId hovered() const { return hovered_; }
+   [[nodiscard]] WidgetId focused() const { return focused_; }
++  // Read-only text edit selection/caret for external Figma-native
++  // controls. This does not expose the editable internal map and
++  // allocates nothing; callers must not retain the returned pointer.
++  [[nodiscard]] const TextEditState* textEditState(WidgetId id) const noexcept {
++    const auto it = textEdits_.find(id);
++    return it == textEdits_.end() ? nullptr : &it->second;
++  }
+   void focus(WidgetId id) noexcept { focused_ = id; }
+   void resetTextEdit(WidgetId id, std::string_view value, bool select_all = false) {
+     textEdits_[id].reset(value, select_all);
+@@ -135,6 +159,7 @@ private:
+   bool overlayClaimed_ = false;
+   std::unordered_map<WidgetId, TextEditState> textEdits_;
+   ClipboardCallbacks clipboard_;
++  bool inputOnly_ = false;
+ };
+ 
+ } // namespace slugia
+diff --git a/include/slugia/vulkan_renderer.hpp b/include/slugia/vulkan_renderer.hpp
+index b4a3f48..2b94855 100644
+--- a/include/slugia/vulkan_renderer.hpp
++++ b/include/slugia/vulkan_renderer.hpp
+@@ -29,6 +29,10 @@ struct RendererConfig {
+   // over blending in sRGB; SRGB images would linearize in the blend unit.
+   // Off by default: preserve existing linear-light behavior for non-Figma apps.
+   bool preferSrgbAlphaCompositing = false;
++  // ExternalImage RGBA32F pixels are display-encoded sRGB rather than linear.
++  // Off by default for existing Slugia clients. In sRGB source mode, a UNORM
++  // swapchain writes values directly; an *_SRGB swapchain decodes them first.
++  bool externalImagesAreSrgb = false;
+   Color clearColor = Color::fromRgb8(0x0b1020);
+   bool validation = false;
+   // false prefers refresh-synchronized MAILBOX for smooth low-latency interaction.
+@@ -75,6 +79,15 @@ struct RendererConfig {
+   // Optional host wall intervals around renderer API work; off by default.
+   // Intervals include OS descheduling and do not measure active CPU cycles.
+   bool enableCpuPhaseTiming = false;
++  // Opt-in, capped per-process Vulkan pipeline cache. Shares only CPU-side
++  // driver cache bytes across separate windows/devices (never Vk objects).
++  bool enableInProcessPipelineCache = false;
++  // Explicit opt-in; reports initialization phase timings only.
++  bool enableStartupProfiling = false;
++  // Embedded native modal windows must not spin indefinitely if the
++  // compositor continuously invalidates a swapchain. Zero preserves the
++  // historical standalone behavior; clients opt into a bounded retry.
++  std::uint32_t maxOutOfDateRetries = 0;
+ 
+   // Conservative profile for low-memory / integrated-GPU hosts and battery-sensitive tools.
+   [[nodiscard]] static RendererConfig lowSpec() noexcept {
+diff --git a/src/shaders/vector.frag b/src/shaders/vector.frag
+index 8547307..7a4f915 100644
+--- a/src/shaders/vector.frag
++++ b/src/shaders/vector.frag
+@@ -570,7 +570,16 @@ void main() {
+                       uintBitsToFloat(externalPixelWords[offset + 2u]),
+                       uintBitsToFloat(externalPixelWords[offset + 3u]),
+                       uintBitsToFloat(externalPixelWords[offset]));
+-    if (pushConstants.translationOverride.w <= 0.5) color.rgb = linearToSrgb(color.rgb);
++    // External images can provide either linear RGB (legacy/default) or
++    // display-encoded sRGB (Color Picker RGBA32F). The framebuffer transfer
++    // function is applied exactly once in either presentation format.
++    if (pushConstants.opacity.z > 0.5) {
++      if (pushConstants.translationOverride.w > 0.5)
++        color.rgb = srgbToLinear(clamp(color.rgb, 0.0, 1.0));
++      // UNORM sRGB_NONLINEAR: already encoded; do not encode again.
++    } else if (pushConstants.translationOverride.w <= 0.5) {
++      color.rgb = linearToSrgb(color.rgb);
++    }
+     color.a *= paintData.y * roundedClipAlpha();
+     outColor = color;
+     return;
+diff --git a/src/slugui.cpp b/src/slugui.cpp
+index 5e08a1e..4063fcc 100644
+--- a/src/slugui.cpp
++++ b/src/slugui.cpp
+@@ -1560,6 +1560,10 @@ struct Runtime::Impl {
+         drawList.shape(shapeVisual->strokeShape, placed(shapeVisual->strokePlacement),
+                        paint(shapeVisual->strokePaint, entry, properties, input));
+       }
++    } else if (const auto* imageVisual = std::get_if<ExternalImageVisual>(&entry.element->visual)) {
++      if (imageVisual->image != 0 && imageVisual->width != 0 && imageVisual->height != 0)
++        drawList.externalImage(imageVisual->image, entry.box.bounds,
++                               imageVisual->width, imageVisual->height);
+     } else if (const auto* textVisual = std::get_if<TextVisual>(&entry.element->visual)) {
+       auto style = textVisual->style;
+       style.size *= scale;
+diff --git a/src/ui.cpp b/src/ui.cpp
+index fe087dd..b5ac9f7 100644
+--- a/src/ui.cpp
++++ b/src/ui.cpp
+@@ -32,6 +32,16 @@ WidgetId childId(WidgetId parent, std::uint64_t child) {
+   return parent ^ (child + 0x9e3779b97f4a7c15ULL + (parent << 6U) + (parent >> 2U));
+ }
+ 
++// Numeric/HEX and typical ASCII input should not allocate a UTF-8
++// codepoint vector simply to ask how many characters it contains.
++// Keep the legacy Unicode decoder for non-ASCII/malformed sequences.
++std::size_t codepointCount(std::string_view value) {
++  const bool ascii = std::all_of(value.begin(), value.end(), [](unsigned char ch) {
++    return ch < 0x80U;
++  });
++  return ascii ? value.size() : decodeUtf8(value).size();
++}
++
+ std::size_t byteOffsetForCodepoint(std::string_view value, std::size_t target) {
+   std::size_t offset = 0;
+   std::size_t index = 0;
+@@ -140,11 +150,13 @@ Interaction UiContext::interactionImpl(WidgetId id, Rect bounds, bool overlay) {
+ }
+ 
+ void UiContext::rounded(Rect bounds, Paint paint, float radiusPx) {
++  if (inputOnly_) return;
+   const float radius = radiusPx >= 0.0f ? radiusPx : skin_.cornerRadius;
+   draw_->roundedRect(bounds, radius, std::move(paint), skin_.continuousCornersPercent);
+ }
+ 
+ void UiContext::rectangle(Rect bounds, Paint paint) {
++  if (inputOnly_) return;
+   if (skin_.rectangle != 0) {
+     draw_->shape(skin_.rectangle, bounds, std::move(paint));
+     return;
+@@ -153,6 +165,7 @@ void UiContext::rectangle(Rect bounds, Paint paint) {
+ }
+ 
+ void UiContext::controlBackground(Rect bounds, const Interaction& state, bool selected) {
++  if (inputOnly_) return;
+   Paint paint = selected ? skin_.active : skin_.control;
+   if (state.held) paint = skin_.active;
+   else if (state.hovered) paint = skin_.hovered;
+@@ -160,6 +173,7 @@ void UiContext::controlBackground(Rect bounds, const Interaction& state, bool se
+ }
+ 
+ void UiContext::label(std::string_view value, Rect bounds, HorizontalAlign align, Paint* overridePaint) {
++  if (inputOnly_) return;
+   TextStyle style = skin_.text;
+   style.align = align;
+   if (overridePaint) style.paint = *overridePaint;
+@@ -170,6 +184,7 @@ void UiContext::label(std::string_view value, Rect bounds, HorizontalAlign align
+ 
+ bool UiContext::button(WidgetId id, std::string_view text, Rect bounds) {
+   const auto state = interaction(id, bounds);
++  if (inputOnly_) return state.clicked;
+   controlBackground(bounds, state);
+   label(text, bounds, HorizontalAlign::Center);
+   return state.clicked;
+@@ -186,6 +201,7 @@ bool UiContext::spinButton(WidgetId id, std::string_view text, Rect bounds, int&
+   const int old = value;
+   if (minusState.clicked) value = std::max(minimum, value - step);
+   if (plusState.clicked) value = std::min(maximum, value + step);
++  if (inputOnly_) return old != value;
+   controlBackground(bounds, base);
+   if (minusState.hovered || minusState.held) rounded(minus, minusState.held ? skin_.active : skin_.hovered);
+   if (plusState.hovered || plusState.held) rounded(plus, plusState.held ? skin_.active : skin_.hovered);
+@@ -207,6 +223,7 @@ bool UiContext::slider(WidgetId id, std::string_view text, Rect bounds, float& v
+   const float old = value;
+   if (state.held && track.width > 0.0f)
+     value = std::clamp(minimum + (state.cursor.x - track.x) / track.width * range, minimum, maximum);
++  if (inputOnly_) return std::abs(old - value) > 0.000001f;
+   controlBackground(bounds, state);
+   if (!text.empty()) label(text, {bounds.x, bounds.y, labelWidth, bounds.height});
+   rounded(track, state.hovered ? skin_.hovered : skin_.muted, track.height * 0.5f);
+@@ -221,26 +238,29 @@ bool UiContext::slider(WidgetId id, std::string_view text, Rect bounds, float& v
+ 
+ bool UiContext::listBox(WidgetId id, Rect bounds, ListBoxModel& model, float rowHeight) {
+   const auto outer = interaction(id, bounds);
+-  controlBackground(bounds, outer);
++  if (!inputOnly_) controlBackground(bounds, outer);
+   const Rect oldClip = draw_->clip();
+-  draw_->setClip(bounds);
++  if (!inputOnly_) draw_->setClip(bounds);
+   bool changed = false;
+   for (std::size_t i = 0; i < model.items.size(); ++i) {
+     Rect row{bounds.x + 3.0f, bounds.y + 3.0f + rowHeight * static_cast<float>(i), bounds.width - 6.0f, rowHeight};
+     if (row.y >= bounds.y + bounds.height) break;
+     const auto state = interaction(childId(id, i + 1U), row);
+     if (state.clicked) { model.selected = static_cast<int>(i); changed = true; }
+-    if (state.hovered || static_cast<int>(i) == model.selected)
+-      rounded(row, static_cast<int>(i) == model.selected ? skin_.active : skin_.hovered);
+-    label(model.items[i], row);
++    if (!inputOnly_) {
++      if (state.hovered || static_cast<int>(i) == model.selected)
++        rounded(row, static_cast<int>(i) == model.selected ? skin_.active : skin_.hovered);
++      label(model.items[i], row);
++    }
+   }
+-  draw_->setClip(oldClip);
++  if (!inputOnly_) draw_->setClip(oldClip);
+   return changed;
+ }
+ 
+ bool UiContext::checkbox(WidgetId id, std::string_view text, Rect bounds, bool& value) {
+   const auto state = interaction(id, bounds);
+   if (state.clicked) value = !value;
++  if (inputOnly_) return state.clicked;
+   const float boxSize = std::min(bounds.height, 24.0f);
+   Rect box{bounds.x, bounds.y + (bounds.height - boxSize) * 0.5f, boxSize, boxSize};
+   rounded(box, state.hovered ? skin_.hovered : skin_.control);
+@@ -262,7 +282,10 @@ bool UiContext::comboBox(WidgetId id, Rect bounds, ComboBoxModel& model) {
+   const float rowHeight = bounds.height;
+   const Rect menu{bounds.x, bounds.y + bounds.height + 2.0f, bounds.width,
+                   rowHeight * static_cast<float>(model.items.size())};
+-  std::vector<Interaction> rowStates(model.items.size());
++  // Only visual menus need a row-state vector. Input-only menus process
++  // each hit directly, avoiding allocation for closed/hidden overlays.
++  std::vector<Interaction> rowStates;
++  if (model.open && !inputOnly_) rowStates.resize(model.items.size());
+   if (model.open) {
+     overlayOwner_ = id;
+     overlayRect_ = menu;
+@@ -275,8 +298,9 @@ bool UiContext::comboBox(WidgetId id, Rect bounds, ComboBoxModel& model) {
+     for (std::size_t i = 0; model.open && i < model.items.size(); ++i) {
+       const Rect row{menu.x + 2.0f, menu.y + static_cast<float>(i) * rowHeight,
+                      menu.width - 4.0f, rowHeight};
+-      rowStates[i] = interactionImpl(childId(id, i + 17U), row, true);
+-      if (rowStates[i].clicked) {
++      const auto rowState = interactionImpl(childId(id, i + 17U), row, true);
++      if (!inputOnly_) rowStates[i] = rowState;
++      if (rowState.clicked) {
+         model.selected = static_cast<int>(i);
+         model.open = false;
+         overlayClaimed_ = false;
+@@ -285,6 +309,7 @@ bool UiContext::comboBox(WidgetId id, Rect bounds, ComboBoxModel& model) {
+     }
+   }
+ 
++  if (inputOnly_) return changed;
+   controlBackground(bounds, state, model.open);
+   const std::string value = model.selected >= 0 && model.selected < static_cast<int>(model.items.size())
+     ? model.items[static_cast<std::size_t>(model.selected)] : "Select...";
+@@ -315,6 +340,7 @@ bool UiContext::dropdown(WidgetId id, Rect bounds, ComboBoxModel& model) {
+ 
+ bool UiContext::radio(WidgetId id, std::string_view text, Rect bounds, bool selected) {
+   const auto state = interaction(id, bounds);
++  if (inputOnly_) return state.clicked;
+   const float size = std::min(bounds.height, 22.0f);
+   Rect circle{bounds.x, bounds.y + (bounds.height - size) * 0.5f, size, size};
+   draw_->shape(skin_.circle, circle, state.hovered ? skin_.hovered : skin_.control);
+@@ -326,16 +352,25 @@ bool UiContext::radio(WidgetId id, std::string_view text, Rect bounds, bool sele
+ 
+ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::string_view placeholder) {
+   const auto state = interaction(id, bounds);
+-  controlBackground(bounds, state, focused_ == id);
++  if (!inputOnly_) controlBackground(bounds, state, focused_ == id);
+   auto& edit = textEdits_[id];
+   if (state.pressed) {
+     if (edit.value != value) edit.reset(value, false);
+     const float advance = std::max(1.0f, skin_.text.size * 0.52f);
+-    const auto codepoints = decodeUtf8(value);
+     const auto clicked = static_cast<std::size_t>(std::clamp(
+         std::floor((state.cursor.x - bounds.x - 8.0f) / advance + 0.5f), 0.0f,
+-        static_cast<float>(codepoints.size())));
++        static_cast<float>(codepointCount(value))));
+     edit.caret = edit.anchor = byteOffsetForCodepoint(value, clicked);
++  } else if (state.held && focused_ == id && input_ &&
++             std::abs(input_->cursorDelta().x) > .001f) {
++    // Hold the original anchor; dragging can select in either direction,
++    // including dragging outside the field via the Win32 mouse capture.
++    const float advance=std::max(1.f,skin_.text.size*.52f);
++    const auto count=codepointCount(edit.value);
++    const auto hit=static_cast<std::size_t>(std::clamp(
++      std::floor((state.cursor.x-bounds.x-8.f)/advance+.5f),
++      0.f,static_cast<float>(count)));
++    edit.caret=byteOffsetForCodepoint(edit.value,hit);
+   } else if (focused_ != id && edit.value != value) {
+     edit.reset(value, false);
+   }
+@@ -377,23 +412,25 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
+     if (changed) value = edit.value;
+     if (input_->key(Key::Enter).pressed || input_->key(Key::Escape).pressed) focused_ = 0;
+   }
+-  if (focused_ == id && edit.hasSelection()) {
++  if (!inputOnly_ && focused_ == id && edit.hasSelection()) {
+     const float advance = std::max(1.0f, skin_.text.size * 0.52f);
+-    const float begin = static_cast<float>(decodeUtf8(value.substr(0, edit.selectionBegin())).size());
+-    const float end = static_cast<float>(decodeUtf8(value.substr(0, edit.selectionEnd())).size());
++    const float begin = static_cast<float>(codepointCount(std::string_view(value).substr(0, edit.selectionBegin())));
++    const float end = static_cast<float>(codepointCount(std::string_view(value).substr(0, edit.selectionEnd())));
+     Paint selection = skin_.accent;
+     selection.opacity *= 0.32f;
+     rounded({bounds.x + 8.0f + begin * advance, bounds.y + 4.0f,
+              std::max(1.0f, (end - begin) * advance), bounds.height - 8.0f},
+             selection, 2.0f);
+   }
+-  if (value.empty()) {
+-    Paint faded = skin_.muted;
+-    label(placeholder, bounds, HorizontalAlign::Left, &faded);
+-  } else label(value, bounds);
+-  if (focused_ == id && (frame_ / 30U) % 2U == 0U) {
++  if (!inputOnly_) {
++    if (value.empty()) {
++      Paint faded = skin_.muted;
++      label(placeholder, bounds, HorizontalAlign::Left, &faded);
++    } else label(value, bounds);
++  }
++  if (!inputOnly_ && focused_ == id && (frame_ / 30U) % 2U == 0U) {
+     const float approximateX = bounds.x + 9.0f +
+-      static_cast<float>(decodeUtf8(value.substr(0, edit.caret)).size()) * skin_.text.size * 0.52f;
++      static_cast<float>(codepointCount(std::string_view(value).substr(0, edit.caret))) * skin_.text.size * 0.52f;
+     rectangle( {std::min(approximateX, bounds.x + bounds.width - 5.0f), bounds.y + 6.0f,
+                                    1.5f, bounds.height - 12.0f}, skin_.accent);
+   }
+@@ -403,7 +440,7 @@ bool UiContext::textField(WidgetId id, Rect bounds, std::string& value, std::str
+ bool UiContext::textArea(WidgetId id, Rect bounds, std::string& value, Vec2& scroll,
+                          std::string_view placeholder, TextAreaOptions options) {
+   const auto state = interaction(id, bounds);
+-  controlBackground(bounds, state, focused_ == id);
++  if (!inputOnly_) controlBackground(bounds, state, focused_ == id);
+   auto& edit = textEdits_[id];
+   const float advance = std::max(
+       1.0f, skin_.text.size * (options.monospaced ? 0.6f : 0.52f));
+@@ -520,6 +557,9 @@ bool UiContext::textArea(WidgetId id, Rect bounds, std::string& value, Vec2& scr
+       scroll.y = std::max(0.0f, caretY + lineHeight - inner.height);
+   }
+ 
++  // Scroll and edit state are already up-to-date. The consumer paints the
++  // caret and text, so skip all glyph layout, clips and DrawList commands.
++  if (inputOnly_) return changed;
+   const Rect previousClip = draw_->clip();
+   if (options.showLineNumbers && gutterWidth > 0.0f) {
+     const Rect gutter{bounds.x + 4.0f, inner.y, gutterWidth, inner.height};
+@@ -664,6 +704,7 @@ bool UiContext::toggle(WidgetId id, std::string_view text, Rect bounds, bool& va
+     value = !value;
+     changed = true;
+   }
++  if (inputOnly_) return changed;
+   const float switchWidth = std::min(48.0f, bounds.width * 0.35f);
+   Rect track{bounds.x + bounds.width - switchWidth, bounds.y + 4.0f, switchWidth, bounds.height - 8.0f};
+   label(text, {bounds.x, bounds.y, bounds.width - switchWidth - 6.0f, bounds.height});
+@@ -686,6 +727,7 @@ bool UiContext::scrollBar(WidgetId id, Rect bounds, float& value, float pageRati
+     const float p = vertical ? state.cursor.y - bounds.y : state.cursor.x - bounds.x;
+     value = std::clamp((p - thumbLength * 0.5f) / std::max(length - thumbLength, 1.0f), 0.0f, 1.0f);
+   }
++  if (inputOnly_) return std::abs(old - value) > 0.000001f;
+   rounded(bounds, state.hovered ? skin_.hovered : skin_.control);
+   Rect thumb = bounds;
+   if (vertical) { thumb.y += (length - thumbLength) * value; thumb.height = thumbLength; }
+@@ -695,7 +737,7 @@ bool UiContext::scrollBar(WidgetId id, Rect bounds, float& value, float pageRati
+ }
+ 
+ void UiContext::tooltip(WidgetId anchor, std::string_view text, Rect bounds) {
+-  if (hovered_ != anchor) return;
++  if (inputOnly_ || hovered_ != anchor) return;
+   const Rect oldClip = draw_->clip();
+   draw_->setClip(rootClip_);
+   draw_->beginOverlay();
+@@ -734,29 +776,31 @@ bool UiContext::treeNode(WidgetId id, TreeNode& node, float x, float& y, float w
+ 
+ bool UiContext::treeView(WidgetId id, Rect bounds, std::vector<TreeNode>& roots, float rowHeight) {
+   const auto state = interaction(id, bounds);
+-  controlBackground(bounds, state);
++  if (!inputOnly_) controlBackground(bounds, state);
+   const Rect old = draw_->clip();
+-  draw_->setClip(bounds);
++  if (!inputOnly_) draw_->setClip(bounds);
+   float y = bounds.y + 3.0f;
+   bool changed = false;
+   for (std::size_t i = 0; i < roots.size(); ++i)
+     changed = treeNode(childId(id, static_cast<WidgetId>(i + 1U)), roots[i],
+                        bounds.x + 3.0f, y, bounds.width - 6.0f, rowHeight, 0, bounds) || changed;
+-  draw_->setClip(old);
++  if (!inputOnly_) draw_->setClip(old);
+   return changed;
+ }
+ 
+ bool UiContext::gridView(WidgetId id, Rect bounds, GridModel& model, float rowHeight) {
+   const auto outer = interaction(id, bounds);
+-  controlBackground(bounds, outer);
++  if (!inputOnly_) controlBackground(bounds, outer);
+   if (model.headers.empty()) return false;
+   const Rect old = draw_->clip();
+-  draw_->setClip(bounds);
++  if (!inputOnly_) draw_->setClip(bounds);
+   const float columnWidth = bounds.width / static_cast<float>(model.headers.size());
+-  for (std::size_t c = 0; c < model.headers.size(); ++c) {
+-    Rect cell{bounds.x + columnWidth * static_cast<float>(c), bounds.y, columnWidth, rowHeight};
+-    rectangle( cell, skin_.panel);
+-    label(model.headers[c], cell, HorizontalAlign::Center);
++  if (!inputOnly_) {
++    for (std::size_t c = 0; c < model.headers.size(); ++c) {
++      Rect cell{bounds.x + columnWidth * static_cast<float>(c), bounds.y, columnWidth, rowHeight};
++      rectangle(cell, skin_.panel);
++      label(model.headers[c], cell, HorizontalAlign::Center);
++    }
+   }
+   bool changed = false;
+   for (std::size_t r = 0; r < model.rows.size(); ++r) {
+@@ -775,7 +819,7 @@ bool UiContext::gridView(WidgetId id, Rect bounds, GridModel& model, float rowHe
+       if (c < model.rows[r].size()) label(model.rows[r][c], cell);
+     }
+   }
+-  draw_->setClip(old);
++  if (!inputOnly_) draw_->setClip(old);
+   return changed;
+ }
+ 
+diff --git a/src/vulkan_renderer.cpp b/src/vulkan_renderer.cpp
+index 0541f94..6ad6912 100644
+--- a/src/vulkan_renderer.cpp
++++ b/src/vulkan_renderer.cpp
+@@ -23,6 +23,7 @@
+ #include <atomic>
+ #include <bit>
+ #include <chrono>
++#include <cstdio>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+@@ -30,6 +31,7 @@
+ #include <iostream>
+ #include <iterator>
+ #include <limits>
++#include <mutex>
+ #include <optional>
+ #include <set>
+ #include <stdexcept>
+@@ -37,10 +39,28 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
+ namespace slugia {
+ 
+ namespace {
+ 
++struct CpuPipelineCache {
++  std::mutex lock{};
++  std::array<std::uint8_t,VK_UUID_SIZE> uuid{};
++  std::uint32_t vendor=0,device=0,driver=0;
++  std::vector<std::uint8_t> data{};
++};
++CpuPipelineCache& cpuPipelineCache(){
++  static CpuPipelineCache cache;
++  return cache;
++}
++constexpr std::size_t maxCachedPipelineData=2U*1024U*1024U;
+ // UI latency is the primary policy: do not let the CPU build a frame behind another queued frame.
+ constexpr std::size_t framesInFlight = 1;
+ class OptionalCpuPhaseTimer {
+@@ -508,6 +528,7 @@ struct VulkanRenderer::Impl {
+   VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+   VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++  VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+   VkPipeline pipeline = VK_NULL_HANDLE;
+   VkPipeline primitivePipeline = VK_NULL_HANDLE;
+   VkPipeline additivePipeline = VK_NULL_HANDLE;
+@@ -688,10 +709,18 @@ struct VulkanRenderer::Impl {
+             "Atlas band cells must be a power of two from 32 through 2048");
+       if (!vectorAtlas.built())
+         throw std::invalid_argument("VectorAtlas::build() must be called first");
++      // Optional, no allocation or timing syscalls in ordinary operation.
++      using StartupClock=std::chrono::steady_clock;
++      const auto stamp=[&](){return config.enableStartupProfiling?
++                             StartupClock::now():StartupClock::time_point{};};
++      const auto begin=stamp();
+       createInstance();
++      const auto instanceReady=stamp();
+       createSurface();
+       pickPhysicalDevice();
+       createDevice();
++      const auto deviceReady=stamp();
++      createPipelineCache();
+       createCommandPool();
+       if (config.enableIndexedVectorQuads) {
+         // The existing shader maps 0,3 to the same corner and 2,4 to the
+@@ -705,6 +734,7 @@ struct VulkanRenderer::Impl {
+         std::memcpy(vectorQuadIndices.mapped, indices, sizeof(indices));
+       }
+       createTextures();
++      const auto atlasReady=stamp();
+       createBuffer(4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    externalImageFallback, true);
+@@ -721,8 +751,29 @@ struct VulkanRenderer::Impl {
+                    persistentSlugBands, true);
+       prepareAtlasStoragePaths();
+       createDescriptorResources();
++      const auto buffersReady=stamp();
+       createSwapchainResources();
++      const auto swapReady=stamp();
+       createFrames();
++      const auto complete=stamp();
++      if(config.enableStartupProfiling){
++        const auto ms=[](StartupClock::time_point a,
++                         StartupClock::time_point b){
++          return std::chrono::duration<double,std::milli>(b-a).count();
++        };
++        char report[350]{};
++        std::snprintf(report,sizeof(report),
++          "Slugia startup ms: instance=%.2f surface+device=%.2f atlasUpload=%.2f "
++          "buffers=%.2f swapchain+pipelines=%.2f frames=%.2f TOTAL=%.2f\n",
++          ms(begin,instanceReady),ms(instanceReady,deviceReady),
++          ms(deviceReady,atlasReady),ms(atlasReady,buffersReady),
++          ms(buffersReady,swapReady),ms(swapReady,complete),ms(begin,complete));
++#if defined(_WIN32)
++        OutputDebugStringA(report);
++#else
++        std::fputs(report,stderr);
++#endif
++      }
+     } catch (...) {
+       destroy();
+       throw;
+@@ -862,6 +913,55 @@ struct VulkanRenderer::Impl {
+     vkGetDeviceQueue(device, *queueFamilies.present, 0, &presentQueue);
+   }
+ 
++  void createPipelineCache() noexcept {
++    if (!config.enableInProcessPipelineCache || !device) return;
++    std::vector<std::uint8_t> saved{};
++    {
++      auto& shared=cpuPipelineCache();
++      std::lock_guard<std::mutex> guard(shared.lock);
++      if(shared.vendor==deviceProperties.vendorID &&
++         shared.device==deviceProperties.deviceID &&
++         shared.driver==deviceProperties.driverVersion &&
++         shared.data.size()<=maxCachedPipelineData &&
++         std::memcmp(shared.uuid.data(),deviceProperties.pipelineCacheUUID,VK_UUID_SIZE)==0){
++        try{ saved=shared.data; }catch(...){ saved.clear(); }
++      }
++    }
++    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
++    info.initialDataSize=saved.size();
++    info.pInitialData=saved.empty()?nullptr:saved.data();
++    if(vkCreatePipelineCache(device,&info,nullptr,&pipelineCache)!=VK_SUCCESS){
++      // The driver may reject previously valid cache bytes after updating.
++      // An optional cache must NEVER break modal dialog initialization.
++      info.initialDataSize=0;
++      info.pInitialData=nullptr;
++      pipelineCache=VK_NULL_HANDLE;
++      (void)vkCreatePipelineCache(device,&info,nullptr,&pipelineCache);
++    }
++  }
++
++  void retainPipelineCache() noexcept {
++    if(!config.enableInProcessPipelineCache||!device||!pipelineCache)return;
++    std::size_t bytes=0;
++    if(vkGetPipelineCacheData(device,pipelineCache,&bytes,nullptr)!=VK_SUCCESS ||
++       bytes==0||bytes>maxCachedPipelineData)return;
++    try{
++      std::vector<std::uint8_t> data(bytes);
++      if(vkGetPipelineCacheData(device,pipelineCache,&bytes,data.data())!=VK_SUCCESS ||
++         bytes==0||bytes>maxCachedPipelineData)return;
++      data.resize(bytes);
++      auto& shared=cpuPipelineCache();
++      std::lock_guard<std::mutex> guard(shared.lock);
++      shared.vendor=deviceProperties.vendorID;
++      shared.device=deviceProperties.deviceID;
++      shared.driver=deviceProperties.driverVersion;
++      std::memcpy(shared.uuid.data(),deviceProperties.pipelineCacheUUID,VK_UUID_SIZE);
++      shared.data=std::move(data);
++    }catch(...){
++      // A cache is an optimization, never an essential resource.
++    }
++  }
++
+   void createCommandPool() {
+     VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+     info.flags =
+@@ -946,7 +1046,15 @@ struct VulkanRenderer::Impl {
+     throw std::runtime_error("Unsupported Slug atlas texture format");
+   }
+ 
+-  void createTexture(const slughorn::Atlas::TextureData& source, Texture& output) {
++  // During renderer startup, upload both atlas textures with one command
++  // buffer / queue submission / fence-idle instead of synchronizing twice.
++  // Command buffers and staging resources remain alive until GPU completion.
++  void createTexture(const slughorn::Atlas::TextureData& source, Texture& output,
++                     VkCommandBuffer sharedCommand = VK_NULL_HANDLE,
++                     Buffer* stagingDeferred = nullptr) {
++    const bool batched = sharedCommand != VK_NULL_HANDLE;
++    if (batched && !stagingDeferred)
++      throw std::invalid_argument("Batched atlas image requires retained staging");
+     const VkFormat format = atlasTextureFormat(source.format);
+     if (source.empty() || source.width == 0 || source.height == 0)
+       throw std::runtime_error("Slug atlas returned an empty texture");
+@@ -977,7 +1085,7 @@ struct VulkanRenderer::Impl {
+     check(vkAllocateMemory(device, &allocate, nullptr, &output.memory), "vkAllocateMemory(image)");
+     check(vkBindImageMemory(device, output.image, output.memory, 0), "vkBindImageMemory");
+ 
+-    VkCommandBuffer command = beginSingleUse();
++    VkCommandBuffer command = batched ? sharedCommand : beginSingleUse();
+     VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+     toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+     toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+@@ -1005,8 +1113,14 @@ struct VulkanRenderer::Impl {
+     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                          &toShader);
+-    endSingleUse(command);
+-    destroyBuffer(staging);
++    if(batched){
++      // Must not destroy the host-visible staging buffer until the
++      // ONE shared submission has completed on the graphics queue.
++      *stagingDeferred=staging;
++    }else{
++      endSingleUse(command);
++      destroyBuffer(staging);
++    }
+ 
+     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+     view.image = output.image;
+@@ -1028,8 +1142,29 @@ struct VulkanRenderer::Impl {
+ 
+   void createTextures() {
+     const auto& atlas = vectorAtlas.native();
+-    createTexture(atlas.getCurveTextureData(), curveTexture);
+-    createTexture(atlas.getBandTextureData(), bandTexture);
++    Buffer curveStaging{},bandStaging{};
++    VkCommandBuffer uploadCommand=beginSingleUse();
++    bool submitted=false;
++    try {
++      createTexture(atlas.getCurveTextureData(),curveTexture,
++                    uploadCommand,&curveStaging);
++      createTexture(atlas.getBandTextureData(),bandTexture,
++                    uploadCommand,&bandStaging);
++      endSingleUse(uploadCommand);
++      submitted=true;
++    }catch(...){
++      // A partial atlas transfer must not leak a command buffer or its
++      // mapped staging allocations, including on device-allocation failure.
++      if(!submitted){
++        (void)vkQueueWaitIdle(graphicsQueue);
++        vkFreeCommandBuffers(device,commandPool,1,&uploadCommand);
++      }
++      destroyBuffer(curveStaging);
++      destroyBuffer(bandStaging);
++      throw;
++    }
++    destroyBuffer(curveStaging);
++    destroyBuffer(bandStaging);
+     VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+     info.magFilter = VK_FILTER_NEAREST;
+     info.minFilter = VK_FILTER_NEAREST;
+@@ -1478,16 +1613,27 @@ struct VulkanRenderer::Impl {
+     pipelineInfo.layout = pipelineLayout;
+     pipelineInfo.renderPass = renderPass;
+     pipelineInfo.subpass = 0;
+-    check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline),
+-          "vkCreateGraphicsPipelines(vector)");
+-    attachment.dstColorBlendFactor=VK_BLEND_FACTOR_ONE;
+-    attachment.srcAlphaBlendFactor=VK_BLEND_FACTOR_ZERO;
+-    attachment.dstAlphaBlendFactor=VK_BLEND_FACTOR_ONE;
+-    check(vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&pipelineInfo,nullptr,&additivePipeline),
+-          "vkCreateGraphicsPipelines(coverage accumulation)");
+-    attachment.dstColorBlendFactor=VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+-    attachment.srcAlphaBlendFactor=VK_BLEND_FACTOR_ONE;
+-    attachment.dstAlphaBlendFactor=VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++    // Compile compatible vector and coverage-accumulation pipelines in
++    // one Vulkan driver call. Drivers may share shader validation, layout,
++    // and intermediate compilation instead of serially invoking twice.
++    VkPipelineColorBlendAttachmentState additiveAttachment=attachment;
++    additiveAttachment.dstColorBlendFactor=VK_BLEND_FACTOR_ONE;
++    additiveAttachment.srcAlphaBlendFactor=VK_BLEND_FACTOR_ZERO;
++    additiveAttachment.dstAlphaBlendFactor=VK_BLEND_FACTOR_ONE;
++    VkPipelineColorBlendStateCreateInfo additiveBlend=blend;
++    additiveBlend.pAttachments=&additiveAttachment;
++    std::array<VkGraphicsPipelineCreateInfo,2> vectorPipelines{
++        pipelineInfo,pipelineInfo};
++    vectorPipelines[1].pColorBlendState=&additiveBlend;
++    std::array<VkPipeline,2> builtPipelines{VK_NULL_HANDLE,VK_NULL_HANDLE};
++    const VkResult vectorPipelineResult=vkCreateGraphicsPipelines(
++        device,pipelineCache,static_cast<std::uint32_t>(vectorPipelines.size()),
++        vectorPipelines.data(),nullptr,builtPipelines.data());
++    // On partial creation failures Vulkan may return valid handles for
++    // completed pipelines. Retain them for normal exception cleanup.
++    pipeline=builtPipelines[0];
++    additivePipeline=builtPipelines[1];
++    check(vectorPipelineResult,"vkCreateGraphicsPipelines(vector+coverage)");
+ 
+     VkPipelineShaderStageCreateInfo primitiveVertexStage{
+         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+@@ -1516,7 +1662,7 @@ struct VulkanRenderer::Impl {
+     primitiveVertexInput.pVertexAttributeDescriptions = primitiveAttributes.data();
+     pipelineInfo.pStages = primitiveStages.data();
+     pipelineInfo.pVertexInputState = &primitiveVertexInput;
+-    check(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
++    check(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineInfo, nullptr,
+                                     &primitivePipeline),
+           "vkCreateGraphicsPipelines(primitive)");
+ 
+@@ -4558,7 +4704,8 @@ struct VulkanRenderer::Impl {
+                              retained ? batch.translation.y : 0.0f, retained ? 1.0f : 0.0f,
+                              isSrgbFormat(swapchainFormat) ? 1.0f : 0.0f},
+                            {batch.clip.x, batch.clip.y, batch.clip.width, batch.clip.height},
+-                           {batch.opacity, 0.0f, 0.0f, 0.0f}};
++                           {batch.opacity, 0.0f,
++                            config.externalImagesAreSrgb ? 1.0f : 0.0f, 0.0f}};
+         if(batch.projected){
+           push.opacity[1]=1.0f;
+           for(std::size_t row=0;row<3;++row)
+@@ -4651,7 +4798,10 @@ struct VulkanRenderer::Impl {
+         (static_cast<std::uint32_t>(framebuffer.x) != extent.width ||
+          static_cast<std::uint32_t>(framebuffer.y) != extent.height))
+       recreateSwapchain();
++    std::uint32_t outOfDateRetries = 0;
+     while (!framePrepared) {
++      if (config.maxOutOfDateRetries && !platformSurface.visible())
++        throw std::runtime_error("Vulkan presentation surface no longer visible");
+       Frame& frame = frames[currentFrame];
+       {
+         OptionalCpuPhaseTimer timer(config.enableCpuPhaseTiming, statistics.cpuPhases.fenceWaitMilliseconds);
+@@ -4673,6 +4823,9 @@ struct VulkanRenderer::Impl {
+             device, swapchain, UINT64_MAX, frame.imageAvailable, VK_NULL_HANDLE, &preparedImageIndex);
+       }
+       if (preparedAcquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
++        if (config.maxOutOfDateRetries &&
++            ++outOfDateRetries >= config.maxOutOfDateRetries)
++          throw std::runtime_error("Vulkan swapchain remained out of date");
+         recreateSwapchain();
+         continue;
+       }
+@@ -4865,6 +5018,13 @@ struct VulkanRenderer::Impl {
+       destroyTexture(bandTexture);
+       if (commandPool)
+         vkDestroyCommandPool(device, commandPool, nullptr);
++      // After pipeline objects are gone, retain only bounded CPU cache data.
++      // Never retain VkDevice/VkPipeline objects after the modal closes.
++      retainPipelineCache();
++      if(pipelineCache){
++        vkDestroyPipelineCache(device,pipelineCache,nullptr);
++        pipelineCache=VK_NULL_HANDLE;
++      }
+       vkDestroyDevice(device, nullptr);
+       device = VK_NULL_HANDLE;
+     }
